@@ -39,6 +39,10 @@
 //
 //M*/
 #include "precomp.hpp"
+#include <sys/time.h>
+
+#define max(i,j) (i > j)?i:j
+#define min(i,j) (i < j)?i:j
 
 /*F///////////////////////////////////////////////////////////////////////////////////////
 //    Name:    cvCreateConDensation
@@ -48,10 +52,10 @@
 //      Kalman     - double pointer to CvConDensation structure
 //      DP         - dimension of the dynamical vector
 //      MP         - dimension of the measurement vector
-//      SamplesNum - number of samples in sample set used in algorithm
+//      SamplesNum - number of samples in sample set used in algorithm 
 //    Returns:
 //    Notes:
-//
+//      
 //F*/
 
 CV_IMPL CvConDensation* cvCreateConDensation( int DP, int MP, int SamplesNum )
@@ -61,7 +65,7 @@ CV_IMPL CvConDensation* cvCreateConDensation( int DP, int MP, int SamplesNum )
 
     if( DP < 0 || MP < 0 || SamplesNum < 0 )
         CV_Error( CV_StsOutOfRange, "" );
-
+    
     /* allocating memory for the structure */
     CD = (CvConDensation *) cvAlloc( sizeof( CvConDensation ));
     /* setting structure params */
@@ -73,6 +77,8 @@ CV_IMPL CvConDensation* cvCreateConDensation( int DP, int MP, int SamplesNum )
     CD->flNewSamples = (float **) cvAlloc( sizeof( float * ) * SamplesNum );
     CD->flSamples[0] = (float *) cvAlloc( sizeof( float ) * SamplesNum * DP );
     CD->flNewSamples[0] = (float *) cvAlloc( sizeof( float ) * SamplesNum * DP );
+    // Set a default value for the scatter range. 
+    CD->scatterRange = 0.5;
 
     /* setting pointers in pointer's arrays */
     for( i = 1; i < SamplesNum; i++ )
@@ -82,7 +88,14 @@ CV_IMPL CvConDensation* cvCreateConDensation( int DP, int MP, int SamplesNum )
     }
 
     CD->State = (float *) cvAlloc( sizeof( float ) * DP );
+
+    // This matrix could be reset by a user, but the identity matrix
+    // will do the trick for the large majority.
     CD->DynamMatr = (float *) cvAlloc( sizeof( float ) * DP * DP );
+    for (int i = 0; i < DP; i++)
+      for (int j = 0; j < DP; j++)
+	CD->DynamMatr[i * DP + j] = (i == j) ? 1.0 : 0.0 ;
+
     CD->flConfidence = (float *) cvAlloc( sizeof( float ) * SamplesNum );
     CD->flCumulative = (float *) cvAlloc( sizeof( float ) * SamplesNum );
 
@@ -103,16 +116,16 @@ CV_IMPL CvConDensation* cvCreateConDensation( int DP, int MP, int SamplesNum )
 //      Kalman     - double pointer to CvConDensation structure
 //      DP         - dimension of the dynamical vector
 //      MP         - dimension of the measurement vector
-//      SamplesNum - number of samples in sample set used in algorithm
+//      SamplesNum - number of samples in sample set used in algorithm 
 //    Returns:
 //    Notes:
-//
+//      
 //F*/
 CV_IMPL void
 cvReleaseConDensation( CvConDensation ** ConDensation )
 {
     CvConDensation *CD = *ConDensation;
-
+    
     if( !ConDensation )
         CV_Error( CV_StsNullPtr, "" );
 
@@ -120,7 +133,7 @@ cvReleaseConDensation( CvConDensation ** ConDensation )
         return;
 
     /* freeing the memory */
-    cvFree( &CD->State );
+	cvFree( &CD->State );
     cvFree( &CD->DynamMatr);
     cvFree( &CD->flConfidence );
     cvFree( &CD->flCumulative );
@@ -142,14 +155,21 @@ cvReleaseConDensation( CvConDensation ** ConDensation )
 //    Parameters:
 //      Kalman     - pointer to CvConDensation structure
 //    Returns:
-//    Notes:
-//
+//    Notes: Modified considerably to fix resampling stage and address
+//           usage issues by Tom Sgouros, February 2013.
+//      
 //F*/
 CV_IMPL void
 cvConDensUpdateByTime( CvConDensation * ConDens )
 {
     int i, j;
     float Sum = 0;
+    // These are used in the resampling algorithm.
+    struct CvRandState* randState;
+    float randNumber;
+
+    // Use this to improve the random number generation.
+    struct timeval tv;
 
     if( !ConDens )
         CV_Error( CV_StsNullPtr, "" );
@@ -170,20 +190,91 @@ cvConDensUpdateByTime( CvConDensation * ConDens )
     /* Taking the new vector from transformation of mean by dynamics matrix */
 
     icvScaleVector_32f( ConDens->Temp, ConDens->Temp, ConDens->DP, 1.f / Sum );
-    icvTransformVector_32f( ConDens->DynamMatr, ConDens->Temp, ConDens->State, ConDens->DP,
-                             ConDens->DP );
-    Sum = Sum / ConDens->SamplesNum;
+
+    // Note that the DynamMatr *must* be initialized by the calling function.
+    // The cvCreateConDensation function does not initialize it.  
+    // Initializing it to an identity matrix would be a good choice.
+    icvTransformVector_32f( ConDens->DynamMatr, ConDens->Temp, ConDens->State, 
+			    ConDens->DP, ConDens->DP );
+
+    // Initialize the random number generator.
+    gettimeofday(&tv, NULL);
+    cvRandInit( randState, 0, Sum, tv.tv_usec);
+
+    // We want a record of the span of the particle distribution.  The resampled
+    // distribution is dependent on this quantity.
+    float sampleMax[ConDens->DP], sampleMin[ConDens->DP];
+    for (int k = 0; k < ConDens->DP; k++) 
+      {
+	sampleMax[k] = -1.0e35; sampleMin[k] = 1.0e35;
+      }
 
     /* Updating the set of random samples */
+    // The algorithm of the original code always picked the last
+    // sample, so was not really a weighted random re-sample.  It
+    // wasn't really random, either, due to careless seeding of the
+    // random number generation.
+
+    // This version resamples according to the weights calculated by
+    // the calling program and tries to be more consistent about
+    // seeding the random number generator more carefully.
     for( i = 0; i < ConDens->SamplesNum; i++ )
-    {
+      {
+	// Choose a random number between 0 and the sum of the particles' 
+	// weights.
+	cvbRand(randState, &randNumber, 1);
+
+	// Use that random number to choose one of the particles.
         j = 0;
-        while( (ConDens->flCumulative[j] <= (float) i * Sum)&&(j<ConDens->SamplesNum-1))
+        while( (ConDens->flCumulative[j] <= randNumber) && 
+	       (j<ConDens->SamplesNum-1))
         {
             j++;
         }
-        icvCopyVector_32f( ConDens->flSamples[j], ConDens->DP, ConDens->flNewSamples[i] );
+
+	// Copy the chosen particle.
+        icvCopyVector_32f( ConDens->flSamples[j], ConDens->DP, 
+			   ConDens->flNewSamples[i] );
+
+	// Keep track of the max and min of the sample particles.
+	// We'll use that to calculate the size of the distribution.
+	for (int k = 0; k < ConDens->DP; k++) 
+	  {
+	    sampleMax[k] = max(sampleMax[k], *(ConDens->flNewSamples[i] + k));
+	    sampleMin[k] = min(sampleMin[k], *(ConDens->flNewSamples[i] + k));
+	  }
+
+      }
+
+    /* Reinitializes the structures to update samples randomly */
+    for(int k = 0; k < ConDens->DP; k++ )
+      {
+
+	// What's happening here is that the random perturbations used
+	// to wiggle the sample points are sized proportionally to the
+	// size of the distribution's span.  So if the the samples go
+	// from 2 through 5 in some dimension, the random
+	// perturbations will go from -1.5 to 1.5.  (So long as the
+	// scatterRange parameter is set to 0.5.)
+	float diff = ConDens->scatterRange * (sampleMax[k] - sampleMin[k]);
+
+	// This line may not be strictly necessary, but it prevents
+	// the particles from congealing into a single particle in the
+	// event of a poor choice of fitness (weighting) function.
+	diff = max(diff, 0.02 * ConDens->flNewSamples[0][k]);
+
+	// Re-seed the random number generation, and set the limits
+	// relative to the geometric extent of the distribution.
+	gettimeofday(&tv, NULL);
+        cvRandInit( &(ConDens->RandS[k]),
+                    -diff, diff,
+                    tv.tv_usec + k);
+	// We ask for a random number just to give the electronic
+	// roulette wheel a good spin.  We're not doing anything with
+	// this number.
+	cvbRand( ConDens->RandS + k, ConDens->RandomSample + k, 1);
     }
+
 
     /* Adding the random-generated vector to every vector in sample set */
     for( i = 0; i < ConDens->SamplesNum; i++ )
@@ -196,7 +287,7 @@ cvConDensUpdateByTime( CvConDensation * ConDens )
         icvTransformVector_32f( ConDens->DynamMatr, ConDens->flNewSamples[i],
                                  ConDens->flSamples[i], ConDens->DP, ConDens->DP );
         icvAddVector_32f( ConDens->flSamples[i], ConDens->RandomSample, ConDens->flSamples[i],
-                           ConDens->DP );
+	                 ConDens->DP );
     }
 }
 
@@ -210,7 +301,7 @@ cvConDensUpdateByTime( CvConDensation * ConDens )
 //    lowerBound  - vector of upper bounds used to random update of sample set
 //    Returns:
 //    Notes:
-//
+//      
 //F*/
 
 CV_IMPL void

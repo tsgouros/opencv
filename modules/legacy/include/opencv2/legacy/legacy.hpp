@@ -1170,6 +1170,7 @@ typedef struct CvConDensation
     float* Temp;            /* Temporary vector                      */
     float* RandomSample;    /* RandomVector to update sample set     */
     struct CvRandState* RandS; /* Array of structures to generate random vectors */
+    float scatterRange;     /* Range used in the resampling stage.  Default 0.5 */
 } CvConDensation;
 
 /* Creates ConDensation filter state */
